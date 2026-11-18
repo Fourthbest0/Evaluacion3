@@ -1,0 +1,2 @@
+com\ejemplo\msb\config\SecurityConfig.class
+com\ejemplo\msb\config\FeignAuthInterceptor.class

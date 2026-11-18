@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frontend MS-A / MS-B</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#222}
+  header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #ddd;padding-bottom:.75rem}
+  section{margin:1.5rem 0;padding:1rem;border:1px solid #ddd;border-radius:8px}
+  button{padding:.4rem .8rem;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer}
+  button.danger{background:#dc2626} button.sec{background:#6b7280}
+  input{padding:.4rem;margin-right:.4rem} table{width:100%;border-collapse:collapse;margin-top:.5rem}
+  td,th{border-bottom:1px solid #eee;padding:.35rem;text-align:left}
+  #msg{padding:.6rem;border-radius:6px;display:none;margin-top:1rem}
+  #msg.err{display:block;background:#fee2e2} #msg.ok{display:block;background:#dcfce7}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h2>MS-A / MS-B protegidos con OAuth2</h2>
+  <div id="userbox"></div>
+</header>
+<div id="msg"></div>
+
+<section id="loggedOut">
+  <p>Debes iniciar sesión para usar los microservicios.</p>
+  <button id="btnLogin">Iniciar sesión</button>
+</section>
+
+<div id="app" class="hidden">
+  <section>
+    <h3>MS-A · Entity A <small>(puerto 81)</small></h3>
+    <input id="nombreA" placeholder="nombreA">
+    <button id="btnCrearA">Crear</button>
+    <button class="sec" id="btnListarA">Listar</button>
+    <table><thead><tr><th>ID</th><th>nombreA</th><th></th></tr></thead><tbody id="tablaA"></tbody></table>
+    <small>Borrar requiere rol ADMIN (con <code>usuario</code> verás un 403).</small>
+  </section>
+
+  <section>
+    <h3>MS-B · Entity B <small>(puerto 82, consulta a MS-A por Feign)</small></h3>
+    <input id="nombreB" placeholder="nombreB">
+    <input id="idsA" placeholder="ids de A (ej. 1,2)">
+    <button id="btnCrearB">Crear</button>
+    <button class="sec" id="btnListarB">Listar</button>
+    <table><thead><tr><th>ID</th><th>nombreB</th><th>nombreA</th></tr></thead><tbody id="tablaB"></tbody></table>
+  </section>
+</div>
+
+<script>
+// ===== Configuración =====
+const AUTH_URL  = 'http://localhost:9000';
+const MS_A_URL  = 'http://localhost:81/api/entity-a';
+const MS_B_URL  = 'http://localhost:82/api/entity-b';
+const CLIENT_ID = 'frontend-client';
+const REDIRECT  = location.origin + '/';          // debe ser http://127.0.0.1:3000/
+const SCOPES    = 'openid profile entity-a.read entity-a.write entity-b.read entity-b.write';
+
+// ===== Utilidades =====
+const $ = id => document.getElementById(id);
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const rand = n => b64url(crypto.getRandomValues(new Uint8Array(n)));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function show(text, ok=false){ const m=$('msg'); m.textContent=text; m.className=ok?'ok':'err'; }
+function decodeJwt(t){ try{ return JSON.parse(atob(t.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'))); }catch{ return {}; } }
+
+// ===== Login: Authorization Code + PKCE =====
+async function login(){
+  const verifier = rand(32), state = rand(16);
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  sessionStorage.setItem('pkce_verifier', verifier);
+  sessionStorage.setItem('oauth_state', state);
+  location.href = AUTH_URL + '/oauth2/authorize?' + new URLSearchParams({
+    response_type:'code', client_id:CLIENT_ID, redirect_uri:REDIRECT, scope:SCOPES,
+    state, code_challenge:challenge, code_challenge_method:'S256'
+  });
+}
+
+async function handleCallback(){
+  const p = new URLSearchParams(location.search);
+  if (!p.has('code') && !p.has('error')) return;
+  history.replaceState({}, '', REDIRECT);
+  if (p.has('error')) return show('Error de autenticación: ' + p.get('error'));
+  if (p.get('state') !== sessionStorage.getItem('oauth_state')) return show('State inválido');
+  const res = await fetch(AUTH_URL + '/oauth2/token', {
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({
+      grant_type:'authorization_code', code:p.get('code'), redirect_uri:REDIRECT,
+      client_id:CLIENT_ID, code_verifier:sessionStorage.getItem('pkce_verifier')
+    })
+  });
+  if (!res.ok) return show('No se pudo obtener el token (' + res.status + ')');
+  const t = await res.json();
+  sessionStorage.setItem('access_token', t.access_token);
+  sessionStorage.setItem('id_token', t.id_token || '');
+  sessionStorage.removeItem('pkce_verifier'); sessionStorage.removeItem('oauth_state');
+}
+
+function logout(){
+  const idt = sessionStorage.getItem('id_token');
+  sessionStorage.clear();
+  // Cierra también la sesión en el Authorization Server (OIDC RP-Initiated Logout)
+  location.href = AUTH_URL + '/connect/logout?' + new URLSearchParams({
+    id_token_hint: idt, post_logout_redirect_uri: REDIRECT, client_id: CLIENT_ID
+  });
+}
+
+// ===== Llamadas a la API con Bearer token =====
+async function api(url, options={}){
+  const token = sessionStorage.getItem('access_token');
+  const claims = decodeJwt(token || '');
+  if (!token || (claims.exp && claims.exp*1000 < Date.now())){ sessionStorage.clear(); render(); show('Sesión expirada, inicia sesión de nuevo'); throw new Error('expired'); }
+  const res = await fetch(url, { ...options, headers:{
+    'Authorization':'Bearer ' + token, 'Content-Type':'application/json', ...(options.headers||{}) }});
+  if (res.status === 401){ sessionStorage.clear(); render(); show('401: token inválido o expirado'); throw new Error('401'); }
+  if (res.status === 403){ show('403: no tienes permiso para esta operación'); throw new Error('403'); }
+  if (!res.ok){ show('Error ' + res.status); throw new Error(String(res.status)); }
+  return res.status === 204 ? null : res.json();
+}
+
+async function listarA(){
+  const data = await api(MS_A_URL);
+  $('tablaA').innerHTML = data.map(a =>
+    `<tr><td>${esc(a.id)}</td><td>${esc(a.nombreA)}</td><td><button class="danger" data-del="${esc(a.id)}">Borrar</button></td></tr>`).join('');
+}
+async function listarB(){
+  const data = await api(MS_B_URL);
+  $('tablaB').innerHTML = data.map(b =>
+    `<tr><td>${esc(b.id)}</td><td>${esc(b.nombreB)}</td><td>${esc(b.nombreA)}</td></tr>`).join('');
+}
+
+// ===== Render =====
+function render(){
+  const token = sessionStorage.getItem('access_token');
+  $('loggedOut').classList.toggle('hidden', !!token);
+  $('app').classList.toggle('hidden', !token);
+  if (!token){ $('userbox').innerHTML=''; return; }
+  const c = decodeJwt(token);
+  $('userbox').innerHTML = `<b>${esc(c.sub)}</b> (${esc((c.roles||[]).join(', '))}) <button class="sec" id="btnLogout">Salir</button>`;
+  $('btnLogout').onclick = logout;
+}
+
+$('btnLogin').onclick = login;
+$('btnListarA').onclick = () => listarA().catch(()=>{});
+$('btnListarB').onclick = () => listarB().catch(()=>{});
+$('btnCrearA').onclick = async () => {
+  try { await api(MS_A_URL, {method:'POST', body:JSON.stringify({nombreA:$('nombreA').value})});
+        $('nombreA').value=''; show('Entity A creada', true); listarA(); } catch{}
+};
+$('btnCrearB').onclick = async () => {
+  const ids = $('idsA').value.split(',').map(s=>parseInt(s.trim())).filter(n=>!isNaN(n));
+  try { await api(MS_B_URL, {method:'POST', body:JSON.stringify({nombreB:$('nombreB').value, entityAIds:ids})});
+        $('nombreB').value=''; $('idsA').value=''; show('Entity B creada', true); listarB(); } catch{}
+};
+$('tablaA').onclick = async e => {
+  const id = e.target.dataset.del; if (!id) return;
+  try { await api(MS_A_URL + '/' + id, {method:'DELETE'}); show('Eliminada', true); listarA(); } catch{}
+};
+
+(async () => { await handleCallback(); render(); if (sessionStorage.getItem('access_token')) { listarA().catch(()=>{}); listarB().catch(()=>{}); } })();
+</script>
+</body>
+</html>
